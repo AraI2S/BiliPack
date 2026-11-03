@@ -1,16 +1,13 @@
 @echo off
 setlocal
-chcp 65001 >nul
-cd /d "%~dp0"
-where powershell.exe >nul 2>&1
-if errorlevel 1 (
-    echo ERROR: Windows PowerShell is unavailable.
+set "SCRIPT=%~dp0BiliPack.ps1"
+if not exist "%SCRIPT%" (
+    echo BiliPack.ps1 was not found beside Main.bat.
     pause
     exit /b 2
 )
-rem ExecutionPolicy applies to this single process only; no system setting is changed.
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0BiliPack.ps1" %*
-set "result=%ERRORLEVEL%"
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" %*
+set "CODE=%ERRORLEVEL%"
 echo.
-if "%~1"=="" pause
-exit /b %result%
+pause
+exit /b %CODE%

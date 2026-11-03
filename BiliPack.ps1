@@ -1,419 +1,451 @@
-﻿<#
-Batch-mux matching video-only and audio-only files into MP4 without re-encoding.
-Windows PowerShell 5.1 or PowerShell 7; requires ffmpeg.exe and ffprobe.exe.
-
-Double-click Main.bat in the media directory, or run:
-  .\Main.bat -Preview
-  .\Main.bat
-  .\Main.bat -Recurse -VerifyDecode
-  .\Main.bat -Manifest pairs.csv
-
-CSV columns: video,audio,output (output optional; UTF-8 encoding).
-Input paths are relative to the script/input folder; outputs go under merged/.
-Original files are never modified or deleted.
-#>
-
-[CmdletBinding()]
+﻿# BiliPack - lossless MP4 muxing of separated video/audio files.
+# Requires Windows PowerShell 5.1+ and ffmpeg.exe / ffprobe.exe.
+# Run Main.bat and enter a source directory. Outputs go to <source>\Merged.
 param(
     [string]$InputDir = '',
-    [string]$OutputDir = 'merged',
-    [switch]$Recurse,
+    [switch]$Recursive,
     [string]$Manifest = '',
-    [switch]$Preview,
-    [switch]$Force,
+    [switch]$DryRun,
+    [switch]$Overwrite,
     [switch]$VerifyDecode,
-    [switch]$AllowDurationMismatch,
-    [double]$MaxGapSeconds = 2.0
+    [ValidateRange(0, 86400)][double]$MaxGap = 2.0,
+    [switch]$AllowDurationMismatch
 )
 
-$ErrorActionPreference = 'Continue'
-$script:AllowedExtensions = @{
-    '.mp4' = $true; '.m4s' = $true; '.m4a' = $true; '.m4v' = $true
-    '.mov' = $true; '.aac' = $true; '.mp3' = $true; '.mkv' = $true
-    '.webm' = $true; '.ts' = $true
+$ErrorActionPreference = 'Stop'
+$script:Invariant = [System.Globalization.CultureInfo]::InvariantCulture
+$script:KeyComparison = [System.StringComparison]::OrdinalIgnoreCase
+
+function Find-Tool([string]$ToolName) {
+    $local = Join-Path $PSScriptRoot ($ToolName + '.exe')
+    if (Test-Path -LiteralPath $local -PathType Leaf) { return $local }
+    $found = Get-Command ($ToolName + '.exe') -CommandType Application -ErrorAction SilentlyContinue
+    if ($null -ne $found) { return $found.Source }
+    $found = Get-Command $ToolName -CommandType Application -ErrorAction SilentlyContinue
+    if ($null -ne $found) { return $found.Source }
+    throw "找不到 $ToolName.exe；请将 ffmpeg.exe 和 ffprobe.exe 放在脚本旁边，或加入 PATH。"
 }
 
-function Find-Executable([string]$Name) {
-    $besideScript = Join-Path $PSScriptRoot ($Name + '.exe')
-    if (Test-Path -LiteralPath $besideScript -PathType Leaf) { return $besideScript }
-    $command = Get-Command ($Name + '.exe') -CommandType Application -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if ($null -ne $command) { return $command.Source }
-    return $null
+function Name-Key([string]$Value) {
+    return $Value.Normalize([System.Text.NormalizationForm]::FormC).ToUpperInvariant()
 }
 
-function Normalize-Path([string]$Value) {
-    return [System.IO.Path]::GetFullPath($Value)
+function Is-Under([string]$Child, [string]$Parent) {
+    $p = $Parent.TrimEnd([char[]]@('\', '/'))
+    return $Child.Equals($p, $script:KeyComparison) -or
+        $Child.StartsWith(($p + [System.IO.Path]::DirectorySeparatorChar), $script:KeyComparison)
 }
 
-function Is-Inside([string]$Candidate, [string]$Parent) {
-    $p = (Normalize-Path $Candidate).TrimEnd([char[]]@('\', '/'))
-    $b = (Normalize-Path $Parent).TrimEnd([char[]]@('\', '/'))
-    $same = $p.Equals($b, [System.StringComparison]::OrdinalIgnoreCase)
-    $child = $p.StartsWith(($b + [System.IO.Path]::DirectorySeparatorChar),
-        [System.StringComparison]::OrdinalIgnoreCase)
-    return ($same -or $child)
-}
-
-function Resolve-Child([string]$Base, [string]$Relative, [string]$Field) {
-    if ([string]::IsNullOrWhiteSpace($Relative) -or
-        [System.IO.Path]::IsPathRooted($Relative)) {
-        throw "$Field 必须是相对文件路径。"
+function Safe-Relative([string]$Value, [string]$Description, [string]$BaseDirectory) {
+    $raw = $Value.Trim()
+    if ([string]::IsNullOrWhiteSpace($raw) -or [System.IO.Path]::IsPathRooted($raw)) {
+        throw "$Description 必须是非空相对路径：$Value"
     }
-    $full = Normalize-Path (Join-Path $Base $Relative)
-    if (-not (Is-Inside $full $Base) -or $full.Equals($Base,
-            [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "$Field 不得指向指定目录之外。"
+    $parts = $raw -split '[\\/]'
+    if ($parts -contains '..' -or $parts -contains '.') {
+        throw "$Description 不能包含 . 或 .. 路径段：$Value"
     }
+    $full = [System.IO.Path]::GetFullPath((Join-Path $BaseDirectory $raw))
+    if (-not (Is-Under $full $BaseDirectory)) { throw "$Description 超出指定目录：$Value" }
     return $full
 }
 
-function Read-Seconds($Value) {
-    if ($null -eq $Value) { return $null }
-    [double]$number = 0
-    $ok = [double]::TryParse([string]$Value,
-        [System.Globalization.NumberStyles]::Float,
-        [System.Globalization.CultureInfo]::InvariantCulture, [ref]$number)
-    if ($ok -and -not [double]::IsNaN($number) -and
-        -not [double]::IsInfinity($number) -and $number -gt 0) {
-        return $number
+function Read-PositiveNumber($Raw) {
+    $value = 0.0
+    if ([double]::TryParse([string]$Raw, [System.Globalization.NumberStyles]::Float,
+        $script:Invariant, [ref]$value) -and
+        -not [double]::IsNaN($value) -and -not [double]::IsInfinity($value) -and $value -gt 0) {
+        return $value
     }
     return $null
 }
 
-function Read-Probe([string]$Path) {
-    # JSON fields are ASCII except optional metadata; avoid parsing ffmpeg's prose.
-    $probeArgs = @(
-        '-v', 'error', '-show_entries',
-        'stream=index,codec_type,codec_name,duration,disposition:format=duration,format_name',
-        '-of', 'json', $Path
-    )
-    $lines = & $script:ProbeExe @probeArgs 2>$null
-    $code = $LASTEXITCODE
-    if ($code -ne 0) { throw "ffprobe failed (exit $code)." }
-    $json = ($lines -join "`n")
-    if ([string]::IsNullOrWhiteSpace($json)) { throw 'ffprobe returned empty output.' }
-    return ConvertFrom-Json -InputObject $json -ErrorAction Stop
+function Probe-Media([System.IO.FileInfo]$File) {
+    try {
+        $lines = & $script:FFprobe '-v' 'error' '-show_streams' '-show_format' '-of' 'json' $File.FullName 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $lines) { return $null }
+        $obj = ($lines -join "`n") | ConvertFrom-Json
+        $videos = @($obj.streams | Where-Object {
+            $_.codec_type -eq 'video' -and $_.disposition.attached_pic -ne 1
+        })
+        $audios = @($obj.streams | Where-Object { $_.codec_type -eq 'audio' })
+        if ($videos.Count -eq 1 -and $audios.Count -eq 0) {
+            $chosen = $videos[0]; $kind = 'video'
+        } elseif ($audios.Count -eq 1 -and $videos.Count -eq 0) {
+            $chosen = $audios[0]; $kind = 'audio'
+        } else { return $null }
+        $duration = Read-PositiveNumber $chosen.duration
+        if ($null -eq $duration) { $duration = Read-PositiveNumber $obj.format.duration }
+        return [pscustomobject]@{
+            File = $File
+            Path = $File.FullName
+            Kind = $kind
+            Index = [int]$chosen.index
+            Codec = [string]$chosen.codec_name
+            Duration = $duration
+        }
+    } catch { return $null }
 }
 
-function Inspect-Media([string]$Path) {
-    $data = Read-Probe $Path
-    $streams = @($data.streams | Where-Object { $null -ne $_ })
-    $videos = @($streams | Where-Object {
-        $_.codec_type -eq 'video' -and $_.disposition.attached_pic -ne 1
-    })
-    $audios = @($streams | Where-Object { $_.codec_type -eq 'audio' })
-    $type = 'Mixed'
-    $track = $null
-    if ($videos.Count -eq 1 -and $audios.Count -eq 0) {
-        $type = 'Video'; $track = $videos[0]
-    } elseif ($audios.Count -eq 1 -and $videos.Count -eq 0) {
-        $type = 'Audio'; $track = $audios[0]
+function Add-Group([hashtable]$Groups, [string]$Key, $Entry) {
+    if (-not $Groups.ContainsKey($Key)) {
+        $Groups[$Key] = [System.Collections.ArrayList]::new()
     }
-    $seconds = $null
-    $index = $null
-    $codec = $null
-    if ($null -ne $track) {
-        $seconds = Read-Seconds $track.duration
-        $index = [int]$track.index
-        $codec = [string]$track.codec_name
-    }
-    if ($null -eq $seconds) { $seconds = Read-Seconds $data.format.duration }
-    return [pscustomobject]@{
-        Path = $Path; Kind = $type; Index = $index
-        Codec = $codec; Duration = $seconds
-    }
+    [void]$Groups[$Key].Add($Entry)
 }
 
 function New-Pair($Video, $Audio, [string]$Destination, [string]$Source) {
     return [pscustomobject]@{
-        Video = $Video; Audio = $Audio
-        Destination = $Destination; Source = $Source
+        Video = $Video
+        Audio = $Audio
+        Destination = $Destination
+        Source = $Source
     }
 }
 
-function Test-Output([string]$Temp, $Pair, [bool]$Decode) {
-    $info = Read-Probe $Temp
-    $tracks = @($info.streams | Where-Object { $null -ne $_ })
-    $videos = @($tracks | Where-Object { $_.codec_type -eq 'video' })
-    $audios = @($tracks | Where-Object { $_.codec_type -eq 'audio' })
-    $container = [string]$info.format.format_name
-    if ($tracks.Count -ne 2 -or $videos.Count -ne 1 -or $audios.Count -ne 1 -or
-        $videos[0].codec_name -ne $Pair.Video.Codec -or
-        $audios[0].codec_name -ne $Pair.Audio.Codec -or
-        $container -notmatch '(^|,)mp4(,|$)') {
-        throw 'Output track/codec/container verification failed.'
-    }
-    if ((Get-Item -LiteralPath $Temp).Length -le 0) { throw 'Output is empty.' }
+function Show-Progress([string]$Stage, [int]$Done, [int]$Count, [double]$Fraction = 0) {
+    if ($Count -le 0) { return }
+    $pct = 100.0 * (($Done + [Math]::Max(0, [Math]::Min(1, $Fraction))) / $Count)
+    Write-Progress -Id 1 -Activity ("BiliPack | " + $Stage) -Status (
+        ('{0}/{1} | 总体 {2:N1}%' -f $Done, $Count, $pct)) -PercentComplete ([int][Math]::Min(100, $pct))
+}
 
-    foreach ($element in @(
-        [pscustomobject]@{ Input = $Pair.Video; Output = $videos[0] },
-        [pscustomobject]@{ Input = $Pair.Audio; Output = $audios[0] }
-    )) {
-        $original = $element.Input.Duration
-        $produced = Read-Seconds $element.Output.duration
-        if ($null -ne $original -and $null -ne $produced) {
-            $tolerance = [math]::Max(2.0, ([double]$original * 0.001))
-            if ([math]::Abs([double]$produced - [double]$original) -gt $tolerance) {
-                throw "Unexpected $($element.Input.Kind) duration in output."
-            }
+function Check-Output($OutputPath, $Pair, [bool]$FullDecode) {
+    $lines = & $script:FFprobe '-v' 'error' '-show_streams' '-show_format' '-of' 'json' $OutputPath 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $lines) { throw 'ffprobe 无法读取封装结果' }
+    $obj = ($lines -join "`n") | ConvertFrom-Json
+    $streams = @($obj.streams)
+    $vs = @($streams | Where-Object { $_.codec_type -eq 'video' })
+    $as = @($streams | Where-Object { $_.codec_type -eq 'audio' })
+    if ($streams.Count -ne 2 -or $vs.Count -ne 1 -or $as.Count -ne 1 -or
+        $vs[0].codec_name -ne $Pair.Video.Codec -or
+        $as[0].codec_name -ne $Pair.Audio.Codec -or
+        $obj.format.format_name -notmatch 'mp4') {
+        throw '输出轨道、编码或 MP4 容器校验失败'
+    }
+    if ((Get-Item -LiteralPath $OutputPath).Length -eq 0) { throw '输出文件为空' }
+    $actualStreams = @($vs[0], $as[0])
+    $sourceStreams = @($Pair.Video, $Pair.Audio)
+    for ($j = 0; $j -lt 2; $j++) {
+        $actual = Read-PositiveNumber $actualStreams[$j].duration
+        $expected = $sourceStreams[$j].Duration
+        if ($null -ne $expected -and $null -ne $actual -and
+            [Math]::Abs($actual - $expected) -gt [Math]::Max(2.0, $expected * 0.001)) {
+            throw '封装结果中的轨道时长异常'
         }
     }
-    if ($Decode) {
-        $decodeArgs = @(
-            '-hide_banner', '-nostdin', '-v', 'error', '-xerror',
-            '-i', $Temp, '-map', '0:v:0', '-map', '0:a:0', '-f', 'null', '-'
-        )
-        & $script:FfmpegExe @decodeArgs 2>&1 | Out-Host
-        if ($LASTEXITCODE -ne 0) { throw 'Full decode verification failed.' }
+    if ($FullDecode) {
+        & $script:FFmpeg '-hide_banner' '-nostdin' '-v' 'error' '-xerror' '-i' $OutputPath '-map' '0:v:0' '-map' '0:a:0' '-f' 'null' '-' 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw '完整解码校验失败' }
     }
 }
 
-function Run-Pair($Pair, [string]$Root, [string]$OutputRoot) {
-    $video = $Pair.Video
-    $audio = $Pair.Audio
-    $destination = $Pair.Destination
-    $relativeOutput = $destination.Substring($OutputRoot.TrimEnd([char[]]@('\', '/')).Length).TrimStart([char[]]@('\', '/'))
-    Write-Host "`n[$($Pair.Source)] $([IO.Path]::GetFileName($video.Path)) + $([IO.Path]::GetFileName($audio.Path))"
-    Write-Host "  -> $relativeOutput [$($video.Codec) + $($audio.Codec)]"
+function Check-OutputParents([string]$Destination, [string]$OutputRoot) {
+    $dir = [System.IO.Path]::GetDirectoryName($Destination)
+    if (-not (Is-Under $dir $OutputRoot)) { throw '输出路径超出 Merged 目录' }
+    while ((Is-Under $dir $OutputRoot) -and (Test-Path -LiteralPath $dir)) {
+        $item = Get-Item -LiteralPath $dir -Force
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw '输出路径包含符号链接或目录联接，已拒绝写入'
+        }
+        if ($dir.Equals($OutputRoot, $script:KeyComparison)) { break }
+        $dir = [System.IO.Path]::GetDirectoryName($dir)
+    }
+}
 
-    if (-not (Is-Inside $destination $OutputRoot)) {
-        Write-Warning '输出路径超出了目标目录。'
-        return 'Failed'
-    }
-    if ($null -ne $video.Duration -and $null -ne $audio.Duration) {
-        $gap = [math]::Abs([double]$video.Duration - [double]$audio.Duration)
-        if ($gap -gt $MaxGapSeconds) {
-            if (-not $AllowDurationMismatch) {
-                Write-Warning ("音视频时长相差 {0:N3} 秒，超过阈值 {1:N3} 秒，已跳过。" -f $gap, $MaxGapSeconds)
-                return 'Failed'
-            }
-            Write-Warning ("音视频时长相差 {0:N3} 秒，按参数要求继续。" -f $gap)
+function Mux-One($Pair, [int]$Done, [int]$Total, [string]$OutputRoot) {
+    $target = $Pair.Destination
+    $name = [System.IO.Path]::GetFileName($target)
+    Write-Host ('[' + $Pair.Source + '] ' + $Pair.Video.File.Name + ' + ' + $Pair.Audio.File.Name + ' -> ' + $name)
+    if ($null -ne $Pair.Video.Duration -and $null -ne $Pair.Audio.Duration) {
+        $delta = [Math]::Abs($Pair.Video.Duration - $Pair.Audio.Duration)
+        if ($delta -gt $MaxGap -and -not $AllowDurationMismatch) {
+            Write-Host ('  [跳过] 音视频时长相差 {0:N3} 秒，超过 {1:N3} 秒' -f $delta, $MaxGap)
+            return 'failed'
         }
-    } else {
-        Write-Warning '至少一条轨道缺少时长信息，无法执行时长差检查。'
-    }
-
-    if (Test-Path -LiteralPath $destination) {
-        if (-not $Force) {
-            Write-Host '  跳过：输出文件已存在。如需覆盖，请明确使用 -Force。'
-            return 'Existing'
-        }
-        if (-not (Test-Path -LiteralPath $destination -PathType Leaf)) {
-            Write-Warning '输出路径并非普通文件。'
-            return 'Failed'
-        }
-        $existingItem = Get-Item -LiteralPath $destination -Force
-        if (($existingItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-            Write-Warning '拒绝覆盖符号链接或重解析点文件。'
-            return 'Failed'
+        if ($delta -gt $MaxGap) { Write-Host ('  [注意] 音视频时长相差 {0:N3} 秒' -f $delta) }
+    } else { Write-Host '  [注意] 无法取得两条轨道的完整时长信息' }
+    Check-OutputParents $target $OutputRoot
+    if (Test-Path -LiteralPath $target) {
+        $existing = Get-Item -LiteralPath $target -Force
+        if (($existing.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw '输出文件是符号链接，已拒绝覆盖'
         }
     }
-    if ($Preview) {
-        Write-Host '  预览通过，未写入文件。'
-        return 'Preview'
+    if ((Test-Path -LiteralPath $target) -and -not $Overwrite) {
+        Write-Host '  [跳过] 输出已存在；原文件不变'
+        return 'existing'
     }
-
-    $parent = [IO.Path]::GetDirectoryName($destination)
-    $temp = Join-Path $parent ('.' + [IO.Path]::GetFileNameWithoutExtension($destination) +
-        '.' + [Guid]::NewGuid().ToString('N') + '.partial.mp4')
+    if ($DryRun) { Write-Host '  [预览] 可以封装'; return 'dry' }
+    $parent = [System.IO.Path]::GetDirectoryName($target)
+    if (-not [System.IO.Directory]::Exists($parent)) { [void][System.IO.Directory]::CreateDirectory($parent) }
+    Check-OutputParents $target $OutputRoot
+    $tmp = Join-Path $parent ('.' + $name + '.' + [guid]::NewGuid().ToString('N') + '.partial.mp4')
+    $log = [System.IO.Path]::GetTempFileName()
     try {
-        [IO.Directory]::CreateDirectory($parent) | Out-Null
-        Write-Host '  正在封装（直接复制原始音视频流）……'
-        $ffArgs = @(
-            '-hide_banner', '-nostdin', '-loglevel', 'warning', '-n',
-            '-i', $video.Path, '-i', $audio.Path,
-            '-map', ('0:' + $video.Index), '-map', ('1:' + $audio.Index),
+        $ffargs = @(
+            '-hide_banner', '-nostdin', '-loglevel', 'error', '-stats_period', '0.5',
+            '-progress', 'pipe:1', '-n',
+            '-i', $Pair.Video.Path, '-i', $Pair.Audio.Path,
+            '-map', ('0:' + $Pair.Video.Index), '-map', ('1:' + $Pair.Audio.Index),
             '-c', 'copy', '-map_metadata', '0', '-map_chapters', '-1',
             '-disposition:a:0', 'default', '-movflags', '+faststart',
-            '-f', 'mp4', $temp
+            '-f', 'mp4', $tmp
         )
-        & $script:FfmpegExe @ffArgs
-        if ($LASTEXITCODE -ne 0) { throw "ffmpeg failed (exit $LASTEXITCODE)." }
-        Test-Output $temp $Pair ([bool]$VerifyDecode)
-
-        # On Windows, File.Move refuses to replace a pre-existing file.
-        # File.Replace is atomic if -Force was explicitly requested.
-        if (Test-Path -LiteralPath $destination) {
-            if (-not $Force) { throw '封装期间另一个进程创建了同名文件，拒绝覆盖。' }
-            [IO.File]::Replace($temp, $destination, $null)
+        $duration = $Pair.Video.Duration
+        if ($null -eq $duration) { $duration = $Pair.Audio.Duration }
+        & $script:FFmpeg @ffargs 2> $log | ForEach-Object {
+            $line = [string]$_
+            if ($line.StartsWith('out_time=')) {
+                $value = $line.Substring(9)
+                $ts = [timespan]::Zero
+                if ($duration -gt 0 -and [timespan]::TryParse($value, $script:Invariant, [ref]$ts)) {
+                    Show-Progress '封装中' $Done $Total ([Math]::Min(0.99, $ts.TotalSeconds / $duration))
+                }
+            }
+        }
+        if ($LASTEXITCODE -ne 0) {
+            $errors = @(Get-Content -LiteralPath $log -ErrorAction SilentlyContinue | Select-Object -Last 8)
+            throw ('FFmpeg 失败：' + ($errors -join ' '))
+        }
+        Check-Output $tmp $Pair ([bool]$VerifyDecode)
+        if (Test-Path -LiteralPath $target) {
+            if (-not $Overwrite) { throw '封装期间已有其他程序创建同名输出' }
+            if ((Get-Item -LiteralPath $target).PSIsContainer) { throw '输出位置已被目录占用' }
+            [System.IO.File]::Replace($tmp, $target, $null)
         } else {
-            [IO.File]::Move($temp, $destination)
+            [System.IO.File]::Move($tmp, $target)
         }
-        $sizeMiB = (Get-Item -LiteralPath $destination).Length / 1MB
-        Write-Host ("  完成：{0}（{1:N2} MiB）" -f $relativeOutput, $sizeMiB) -ForegroundColor Green
-        return 'Success'
+        $miB = (Get-Item -LiteralPath $target).Length / 1MB
+        Write-Host ('  [完成] {0} ({1:N2} MiB)' -f $target, $miB)
+        return 'success'
     } catch {
-        Write-Warning ("封装失败：{0}" -f $_.Exception.Message)
-        return 'Failed'
+        Write-Host ('  [失败] ' + $_.Exception.Message) -ForegroundColor Red
+        return 'failed'
     } finally {
-        if (Test-Path -LiteralPath $temp -PathType Leaf) {
-            Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
-        }
+        if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $log) { Remove-Item -LiteralPath $log -Force -ErrorAction SilentlyContinue }
     }
 }
 
-# Main entry point.
-if ([string]::IsNullOrWhiteSpace($InputDir)) { $InputDir = $PSScriptRoot }
 try {
-    $root = Normalize-Path $InputDir
-    if (-not (Test-Path -LiteralPath $root -PathType Container)) {
-        throw "扫描目录不存在：$root"
-    }
-    if ([IO.Path]::IsPathRooted($OutputDir)) {
-        $outputRoot = Normalize-Path $OutputDir
-    } else {
-        $outputRoot = Normalize-Path (Join-Path $root $OutputDir)
-    }
-    if ($outputRoot.Equals($root, [StringComparison]::OrdinalIgnoreCase)) {
-        throw '扫描目录和输出目录必须不同。'
-    }
-    if ([double]::IsNaN($MaxGapSeconds) -or [double]::IsInfinity($MaxGapSeconds) -or
-        $MaxGapSeconds -lt 0) { throw '-MaxGapSeconds 必须是非负的有限数值。' }
-
-    $script:FfmpegExe = Find-Executable 'ffmpeg'
-    $script:ProbeExe = Find-Executable 'ffprobe'
-    if (-not $script:FfmpegExe -or -not $script:ProbeExe) {
-        throw '找不到 ffmpeg.exe 或 ffprobe.exe。请放到脚本旁边或加入 PATH。'
-    }
-
-    Write-Host "扫描目录：$root"
-    Write-Host "输出目录：$outputRoot"
-    $mediaByPath = @{}
-    $files = @(Get-ChildItem -LiteralPath $root -File -Recurse:$Recurse -ErrorAction Stop |
-        Sort-Object FullName)
-    foreach ($file in $files) {
-        if (($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
-            -not $script:AllowedExtensions.ContainsKey($file.Extension) -or
-            (Is-Inside $file.FullName $outputRoot)) { continue }
-        try {
-            $media = Inspect-Media $file.FullName
-            $mediaByPath[$file.FullName] = $media
-            if ($media.Kind -eq 'Mixed') {
-                Write-Host "[忽略] 已含音画、多轨道或无法识别：$($file.Name)"
-            }
-        } catch {
-            Write-Warning ("[忽略] 无法检查 {0}：{1}" -f $file.Name, $_.Exception.Message)
+    if ([string]::IsNullOrWhiteSpace($InputDir)) {
+        while ($true) {
+            Write-Host ''
+            $entered = Read-Host '请输入素材目录（粘贴路径，直接回车退出）'
+            if ([string]::IsNullOrWhiteSpace($entered)) { exit 0 }
+            $entered = $entered.Trim().Trim([char[]]@('"', "'"))
+            if (Test-Path -LiteralPath $entered -PathType Container) { $InputDir = $entered; break }
+            Write-Host '[错误] 目录不存在，请重新输入。' -ForegroundColor Yellow
         }
     }
-    Write-Host ("已探测媒体文件：{0}" -f $mediaByPath.Count)
+    if (-not (Test-Path -LiteralPath $InputDir -PathType Container)) {
+        throw '指定目录不存在或无法访问'
+    }
+    $root = (Get-Item -LiteralPath $InputDir -Force).FullName
+    $output = Join-Path $root 'Merged'
+    $script:FFmpeg = Find-Tool 'ffmpeg'
+    $script:FFprobe = Find-Tool 'ffprobe'
+    if (Test-Path -LiteralPath $output) {
+        if (-not (Test-Path -LiteralPath $output -PathType Container)) { throw '目标目录下的 Merged 已被文件占用' }
+        Check-OutputParents (Join-Path $output 'test.mp4') $output
+    }
+    Write-Host ''
+    Write-Host ('素材目录：' + $root)
+    Write-Host ('输出目录：' + $output)
+    Write-Host '规则：同名，或文件名末尾 v（视频）与 a（音频）；均忽略扩展名和大小写'
+    Write-Host ''
 
-    $pairs = [System.Collections.Generic.List[object]]::new()
-    $used = @{}
-    $issues = 0
+    # Enumerate directories ourselves so Merged and junctions are never traversed.
+    $fileList = [System.Collections.ArrayList]::new()
+    $pending = [System.Collections.Generic.Stack[string]]::new()
+    $pending.Push($root)
+    while ($pending.Count -gt 0) {
+        $current = $pending.Pop()
+        foreach ($item in @(Get-ChildItem -LiteralPath $current -Force)) {
+            if ((Is-Under $item.FullName $output) -or
+                (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) { continue }
+            if ($item.PSIsContainer) {
+                if ($Recursive) { $pending.Push($item.FullName) }
+            } else { [void]$fileList.Add($item) }
+        }
+    }
+    $files = $fileList.ToArray()
+    $exactGroups = @{}
+    $avGroups = @{}
+    foreach ($f in $files) {
+        $parentKey = Name-Key $f.DirectoryName
+        $stemKey = Name-Key $f.BaseName
+        Add-Group $exactGroups ($parentKey + [char]0 + $stemKey) $f
+        if ($stemKey.Length -ge 2) {
+            $letter = $stemKey.Substring($stemKey.Length - 1)
+            if ($letter -eq 'V' -or $letter -eq 'A') {
+                $common = $stemKey.Substring(0, $stemKey.Length - 1)
+                Add-Group $avGroups ($parentKey + [char]0 + $common) $f
+            }
+        }
+    }
+
+    # Only probe files with plausible matching names, plus explicit CSV inputs.
+    $candidates = @{}
+    foreach ($group in $exactGroups.Values) {
+        if ($group.Count -ge 2) { foreach ($f in $group) { $candidates[$f.FullName] = $f } }
+    }
+    foreach ($group in $avGroups.Values) {
+        $names = @($group | ForEach-Object { (Name-Key $_.BaseName) })
+        if (@($names | Where-Object { $_.EndsWith('V') }).Count -gt 0 -and
+            @($names | Where-Object { $_.EndsWith('A') }).Count -gt 0) {
+            foreach ($f in $group) { $candidates[$f.FullName] = $f }
+        }
+    }
+
+    $csvRows = @()
     if (-not [string]::IsNullOrWhiteSpace($Manifest)) {
-        $csvPath = $Manifest
-        if (-not [IO.Path]::IsPathRooted($csvPath)) { $csvPath = Join-Path $root $csvPath }
-        $rows = @(Import-Csv -LiteralPath $csvPath -Encoding UTF8 -ErrorAction Stop)
-        if ($rows.Count -gt 0 -and
-            (-not ($rows[0].PSObject.Properties.Name -contains 'video') -or
-             -not ($rows[0].PSObject.Properties.Name -contains 'audio'))) {
-            throw 'CSV 必须包含 video,audio 列，output 为可选列。'
+        $manifestPath = $Manifest
+        if (-not [System.IO.Path]::IsPathRooted($manifestPath)) {
+            $manifestPath = Join-Path $root $manifestPath
         }
-        $line = 1
-        foreach ($row in $rows) {
-            $line++
-            try {
-                $vPath = Resolve-Child $root ([string]$row.video) 'video'
-                $aPath = Resolve-Child $root ([string]$row.audio) 'audio'
-                if (-not $mediaByPath.ContainsKey($vPath) -or
-                    -not $mediaByPath.ContainsKey($aPath)) { throw '找不到有效的输入媒体文件。' }
-                $v = $mediaByPath[$vPath]; $a = $mediaByPath[$aPath]
-                if ($v.Kind -ne 'Video' -or $a.Kind -ne 'Audio') {
-                    throw 'CSV 指定的 video/audio 轨道类型不正确。'
-                }
-                if ($used.ContainsKey($vPath) -or $used.ContainsKey($aPath)) {
-                    throw '同一输入文件在 CSV 中重复配对。'
-                }
-                $outputName = [string]$row.output
-                if ([string]::IsNullOrWhiteSpace($outputName)) {
-                    $outputName = [IO.Path]::GetFileNameWithoutExtension($vPath) + '.mp4'
-                }
-                if (-not $outputName.EndsWith('.mp4', [StringComparison]::OrdinalIgnoreCase)) {
-                    $outputName += '.mp4'
-                }
-                $target = Resolve-Child $outputRoot $outputName 'output'
-                $pairs.Add((New-Pair $v $a $target 'CSV'))
-                $used[$vPath] = $true; $used[$aPath] = $true
-            } catch {
-                $issues++
-                Write-Warning ("CSV 第 {0} 行已跳过：{1}" -f $line, $_.Exception.Message)
+        if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { throw 'CSV 清单不存在' }
+        $csvRows = @(Import-Csv -LiteralPath $manifestPath -Encoding UTF8)
+        if ($csvRows.Count -gt 0 -and
+            (-not ($csvRows[0].PSObject.Properties.Name -contains 'video') -or
+             -not ($csvRows[0].PSObject.Properties.Name -contains 'audio'))) {
+            throw 'CSV 表头必须含有 video,audio，output 可选'
+        }
+        foreach ($row in $csvRows) {
+            foreach ($col in @('video', 'audio')) {
+                $rel = [string]$row.$col
+                $path = Safe-Relative $rel $col $root
+                if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "CSV 中的文件不存在：$rel" }
+                $f = Get-Item -LiteralPath $path
+                $candidates[$f.FullName] = $f
             }
         }
     }
 
-    $groups = @{}
-    foreach ($media in $mediaByPath.Values) {
-        if ($used.ContainsKey($media.Path) -or $media.Kind -eq 'Mixed') { continue }
-        $folderKey = [IO.Path]::GetDirectoryName($media.Path)
-        $stem = [IO.Path]::GetFileNameWithoutExtension($media.Path)
-        $stem = $stem.Normalize([Text.NormalizationForm]::FormC)
-        $key = $folderKey + [char]0 + $stem
-        if (-not $groups.ContainsKey($key)) {
-            $groups[$key] = [System.Collections.Generic.List[object]]::new()
-        }
-        $groups[$key].Add($media)
+    $media = @{}
+    $scan = @($candidates.Values | Sort-Object FullName)
+    for ($i = 0; $i -lt $scan.Count; $i++) {
+        Show-Progress '检查媒体轨道' $i $scan.Count
+        $m = Probe-Media $scan[$i]
+        if ($null -ne $m) { $media[$m.Path] = $m }
     }
-    foreach ($key in @($groups.Keys | Sort-Object)) {
-        $group = @($groups[$key].ToArray())
-        $videos = @($group | Where-Object { $_.Kind -eq 'Video' })
-        $audios = @($group | Where-Object { $_.Kind -eq 'Audio' })
-        if ($videos.Count -eq 1 -and $audios.Count -eq 1) {
-            $v = $videos[0]; $a = $audios[0]
-            $relativeDir = $v.Path.Substring($root.TrimEnd([char[]]@('\', '/')).Length).TrimStart([char[]]@('\', '/'))
-            $relativeDir = [IO.Path]::GetDirectoryName($relativeDir)
-            $outputName = [IO.Path]::GetFileNameWithoutExtension($v.Path) + '.mp4'
-            $targetDir = $outputRoot
-            if ($relativeDir) { $targetDir = Join-Path $outputRoot $relativeDir }
-            $target = Join-Path $targetDir $outputName
-            $pairs.Add((New-Pair $v $a $target 'AUTO'))
-        } elseif ($videos.Count -gt 0 -and $audios.Count -gt 0) {
-            $issues++
-            $stemLabel = [IO.Path]::GetFileNameWithoutExtension($group[0].Path)
-            Write-Warning ("同名存在歧义：{0}（{1} 条视频、{2} 条音频）。" -f $stemLabel, $videos.Count, $audios.Count)
-        } else {
-            foreach ($item in $group) {
-                Write-Host "[未配对] $([IO.Path]::GetFileName($item.Path)) [$($item.Kind)]"
-            }
+    Write-Progress -Id 1 -Activity 'BiliPack | 检查媒体轨道' -Completed
+    Write-Host ('发现 {0} 个潜在素材，确认 {1} 个单独音轨/视频轨文件。' -f $scan.Count, $media.Count)
+
+    $pairs = [System.Collections.ArrayList]::new()
+    $usedCsv = @{}
+    foreach ($row in $csvRows) {
+        $vPath = Safe-Relative ([string]$row.video) 'video' $root
+        $aPath = Safe-Relative ([string]$row.audio) 'audio' $root
+        if (-not $media.ContainsKey($vPath) -or -not $media.ContainsKey($aPath) -or
+            $media[$vPath].Kind -ne 'video' -or $media[$aPath].Kind -ne 'audio') {
+            throw ('CSV 的音视频轨道类型不符：' + $row.video + ' / ' + $row.audio)
         }
+        if ($usedCsv.ContainsKey($vPath) -or $usedCsv.ContainsKey($aPath)) {
+            throw 'CSV 中的源文件重复使用'
+        }
+        $outName = [string]$row.output
+        if ([string]::IsNullOrWhiteSpace($outName)) {
+            $outName = $media[$vPath].File.BaseName + '.mp4'
+        }
+        if (-not $outName.EndsWith('.mp4', [System.StringComparison]::OrdinalIgnoreCase)) {
+            $outName += '.mp4'
+        }
+        $dest = Safe-Relative $outName 'output' $output
+        [void]$pairs.Add((New-Pair $media[$vPath] $media[$aPath] $dest 'CSV'))
+        $usedCsv[$vPath] = $true
+        $usedCsv[$aPath] = $true
+    }
+
+    $auto = [System.Collections.ArrayList]::new()
+    $ambiguous = 0
+    foreach ($group in $exactGroups.Values) {
+        $items = @($group | Where-Object { $media.ContainsKey($_.FullName) -and -not $usedCsv.ContainsKey($_.FullName) } |
+            ForEach-Object { $media[$_.FullName] })
+        $vs = @($items | Where-Object { $_.Kind -eq 'video' })
+        $as = @($items | Where-Object { $_.Kind -eq 'audio' })
+        if ($vs.Count -eq 1 -and $as.Count -eq 1) {
+            $parentRel = $vs[0].File.DirectoryName.Substring($root.Length).TrimStart([char[]]@('\','/'))
+            $dir = if ($parentRel) { Join-Path $output $parentRel } else { $output }
+            [void]$auto.Add((New-Pair $vs[0] $as[0] (Join-Path $dir ($vs[0].File.BaseName + '.mp4')) '同名'))
+        } elseif ($vs.Count -gt 0 -and $as.Count -gt 0) {
+            $ambiguous++
+            Write-Host ('[歧义] 同名素材有多条视频或音频候选：' + $group[0].BaseName)
+        }
+    }
+    foreach ($group in $avGroups.Values) {
+        $items = @($group | Where-Object { $media.ContainsKey($_.FullName) -and -not $usedCsv.ContainsKey($_.FullName) } |
+            ForEach-Object { $media[$_.FullName] })
+        $vs = @($items | Where-Object { $_.Kind -eq 'video' -and (Name-Key $_.File.BaseName).EndsWith('V') })
+        $as = @($items | Where-Object { $_.Kind -eq 'audio' -and (Name-Key $_.File.BaseName).EndsWith('A') })
+        if ($vs.Count -eq 1 -and $as.Count -eq 1) {
+            $parentRel = $vs[0].File.DirectoryName.Substring($root.Length).TrimStart([char[]]@('\','/'))
+            $dir = if ($parentRel) { Join-Path $output $parentRel } else { $output }
+            $prefix = $vs[0].File.BaseName.Substring(0, $vs[0].File.BaseName.Length - 1)
+            [void]$auto.Add((New-Pair $vs[0] $as[0] (Join-Path $dir ($prefix + '.mp4')) 'a/v'))
+        } elseif ($vs.Count -gt 0 -and $as.Count -gt 0) {
+            $ambiguous++
+            Write-Host ('[歧义] a/v 素材有多条视频或音频候选：' + $group[0].BaseName)
+        }
+    }
+
+    # If a file participates in multiple auto matches, do not guess.
+    $sourceUses = @{}
+    foreach ($p in $auto) {
+        foreach ($path in @($p.Video.Path, $p.Audio.Path)) {
+            if (-not $sourceUses.ContainsKey($path)) { $sourceUses[$path] = 0 }
+            $sourceUses[$path]++
+        }
+    }
+    foreach ($p in $auto) {
+        if ($sourceUses[$p.Video.Path] -gt 1 -or $sourceUses[$p.Audio.Path] -gt 1) {
+            $ambiguous++
+            Write-Host ('[歧义] 文件同时符合多个配对规则，已跳过：' + $p.Video.File.Name)
+        } else { [void]$pairs.Add($p) }
     }
 
     if ($pairs.Count -eq 0) {
-        Write-Warning '没有找到文件对。请确认去掉扩展名后同名，或使用 -Manifest pairs.csv。'
-        exit 1
+        Write-Host '没有找到有效文件对。请检查文件名、实际轨道类型，或提供 CSV 手动清单。'
+        if ($ambiguous -gt 0) { exit 1 }
+        exit 0
     }
-    $destCounts = @{}
-    foreach ($pair in $pairs) {
-        $key = $pair.Destination.Normalize([Text.NormalizationForm]::FormC)
-        if (-not $destCounts.ContainsKey($key)) { $destCounts[$key] = 0 }
-        $destCounts[$key]++
+    $destUses = @{}
+    foreach ($p in $pairs) {
+        $k = Name-Key $p.Destination
+        if (-not $destUses.ContainsKey($k)) { $destUses[$k] = 0 }
+        $destUses[$k]++
     }
-    $summary = @{ Success = 0; Failed = $issues; Existing = 0; Preview = 0 }
-    foreach ($pair in $pairs) {
-        $key = $pair.Destination.Normalize([Text.NormalizationForm]::FormC)
-        if ($destCounts[$key] -gt 1) {
-            Write-Warning ("多组输入映射到了同一输出：{0}" -f $pair.Destination)
-            $summary.Failed++
+    $results = @{ success = 0; failed = $ambiguous; existing = 0; dry = 0 }
+    for ($i = 0; $i -lt $pairs.Count; $i++) {
+        $p = $pairs[$i]
+        Show-Progress '封装中' $i $pairs.Count
+        if ($destUses[(Name-Key $p.Destination)] -gt 1) {
+            Write-Host ('[歧义] 多组素材指向同一个输出，已跳过：' + $p.Destination)
+            $results.failed++
             continue
         }
-        if ($mediaByPath.ContainsKey($pair.Destination)) {
-            Write-Warning ("输出将覆盖某个源文件，已禁止：{0}" -f $pair.Destination)
-            $summary.Failed++
+        if ($media.ContainsKey($p.Destination)) {
+            Write-Host ('[禁止] 输出路径与输入素材重合：' + $p.Destination)
+            $results.failed++
             continue
         }
         try {
-            $result = Run-Pair $pair $root $outputRoot
+            $status = Mux-One $p $i $pairs.Count $output
+            $results[$status]++
         } catch {
-            Write-Warning ("当前配对失败，继续下一对：{0}" -f $_.Exception.Message)
-            $result = 'Failed'
+            $results.failed++
+            Write-Host ('[失败] ' + $_.Exception.Message) -ForegroundColor Red
         }
-        $summary[$result]++
     }
-    $summaryText = "`n结果：完成={0}，预览={1}，已存在={2}，失败或歧义={3}"
-    Write-Host ($summaryText -f $summary.Success, $summary.Preview, $summary.Existing, $summary.Failed)
-    if ($summary.Failed -gt 0) { exit 1 }
+    Write-Progress -Id 1 -Activity 'BiliPack | 封装中' -Completed
+    Write-Host ''
+    Write-Host ('结果：完成 {0}，预览 {1}，已存在 {2}，失败/歧义 {3}' -f
+        $results.success, $results.dry, $results.existing, $results.failed)
+    if ($results.failed -gt 0) { exit 1 }
     exit 0
 } catch {
-    Write-Host ("错误：{0}" -f $_.Exception.Message) -ForegroundColor Red
+    Write-Progress -Id 1 -Activity 'BiliPack' -Completed
+    Write-Host ('[错误] ' + $_.Exception.Message) -ForegroundColor Red
     exit 2
 }
